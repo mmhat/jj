@@ -4126,20 +4126,6 @@ mod tests {
         pub baz: bool,
     }
 
-    const defined_aliases: HashMap<String, AliasDefinition> = HashMap::from([
-        ("level0", AliasDefinition::AliasFor(Vec::from(["resolved", "level0"]))),
-        ("nested", AliasDefinition::NestedAlias(HashMap::from([
-            ("level1", AliasDefinition::AliasFor(Vec::from(["resolved", "level1"]))),
-            ("deep", AliasDefinition::NestedAlias(HashMap::from([
-                ("level2", AliasDefinition::AliasFor(Vec::from(["resolved", "level2"]))),
-            ]))),
-        ]))),
-    ]);
-
-    #[test]
-    fn test_get_alias_match_simple() {
-    }
-
     #[test]
     fn test_merge_args_with() {
         let command = TestArgs::command();
