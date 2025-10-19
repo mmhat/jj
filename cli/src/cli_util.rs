@@ -137,6 +137,7 @@ use jj_lib::workspace::WorkspaceLoaderFactory;
 use jj_lib::workspace::default_working_copy_factories;
 use jj_lib::workspace::get_working_copy_factory;
 use pollster::FutureExt as _;
+use serde::Deserialize;
 use tracing::instrument;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
@@ -3406,54 +3407,111 @@ fn resolve_aliases(
     app: &Command,
     mut string_args: Vec<String>,
 ) -> Result<Vec<String>, CommandError> {
-    let defined_aliases: HashSet<_> = config.table_keys("aliases").collect();
-    let mut resolved_aliases = HashSet::new();
-    let mut real_commands = HashSet::new();
+    let defined_aliases: HashMap<String, AliasDefinition> = config.get("aliases").unwrap();
+
+    let mut real_commands: HashSet<&str> = HashSet::new();
     for command in app.get_subcommands() {
         real_commands.insert(command.get_name());
         for alias in command.get_all_aliases() {
             real_commands.insert(alias);
         }
     }
-    for alias in defined_aliases.intersection(&real_commands).sorted() {
-        writeln!(
-            ui.warning_default(),
-            "Cannot define an alias that overrides the built-in command '{alias}'"
-        )?;
-    }
+    
+    defined_aliases
+        .keys()
+        .map(|key| key.as_str())
+        .collect::<HashSet<_>>()
+        .intersection(&real_commands)
+        .sorted()
+        .for_each(|toplevel_alias| {
+            writeln!(
+                ui.warning_default(),
+                "Cannot define an alias that overrides the built-in command '{toplevel_alias}'"
+            ).ok();
+        });
 
+    let mut resolved_aliases: HashSet<Vec<String>> = HashSet::new();
     loop {
         let app_clone = app.clone().allow_external_subcommands(true);
-        let matches = app_clone.try_get_matches_from(&string_args).ok();
-        if let Some((command_name, submatches)) = matches.as_ref().and_then(|m| m.subcommand())
-            && !real_commands.contains(command_name)
+        let toplevel_matches = app_clone.try_get_matches_from(&string_args).ok();
+        if let Some(matches) = toplevel_matches
+            && let Some(alias_match) = get_alias_match(&matches, &defined_aliases)
+            && let Some(toplevel) = alias_match.name.first()
+            && !real_commands.contains(toplevel.as_str())
         {
-            let alias_name = command_name.to_string();
-            let alias_args = submatches
-                .get_many::<OsString>("")
-                .unwrap_or_default()
-                .map(|arg| arg.to_str().unwrap().to_string())
-                .collect_vec();
-            if resolved_aliases.contains(&*alias_name) {
+            tracing::debug!(
+                "expanding alias {:?} to {:?} with arguments {:?}",
+                alias_match.name,
+                alias_match.definition,
+                alias_match.arguments,
+            );
+            if resolved_aliases.contains(&alias_match.name) {
                 return Err(user_error(format!(
-                    "Recursive alias definition involving `{alias_name}`"
+                    "Recursive alias definition involving `{}`",
+                    alias_match.name.join("."),
                 )));
             }
-            if let Some(&alias_name) = defined_aliases.get(&*alias_name) {
-                let alias_definition: Vec<String> = config.get(["aliases", alias_name])?;
-                assert!(string_args.ends_with(&alias_args));
-                string_args.truncate(string_args.len() - 1 - alias_args.len());
-                string_args.extend(alias_definition);
-                string_args.extend_from_slice(&alias_args);
-                resolved_aliases.insert(alias_name);
-                continue;
-            } else {
-                // Not a real command and not an alias, so return what we've resolved so far
-                return Ok(string_args);
-            }
+            assert!(string_args.ends_with(&alias_match.arguments));
+            string_args.truncate(string_args.len() - alias_match.name.len() - alias_match.arguments.len());
+            string_args.extend(alias_match.definition.clone());
+            string_args.extend(alias_match.arguments);
+            resolved_aliases.insert(alias_match.name);
+            continue;
+        } else {
+            // Not a real command and not an alias, so return what we've resolved so far
+            return Ok(string_args);
         }
-        // No more alias commands, or hit unknown option
-        return Ok(string_args);
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum AliasDefinition {
+    AliasFor(Vec<String>),
+    NestedAlias(HashMap<String, AliasDefinition>),
+}
+
+struct AliasMatch<'a> {
+    name: Vec<String>,
+    definition: &'a Vec<String>,
+    arguments: Vec<String>,
+}
+
+fn get_alias_match<'a>(
+    matches: &'a ArgMatches,
+    defined_aliases: &'a HashMap<String, AliasDefinition>
+) -> Option<AliasMatch<'a>> {
+    let (subcommand, submatches) = matches.subcommand()?;
+    let mut string_args: Vec<String> = vec![subcommand.to_string()];
+    string_args.extend(
+        submatches
+            .get_many::<OsString>("")
+            .unwrap_or_default()
+            .map(|arg| arg.to_str().unwrap().to_string())
+    );
+
+    let mut i = 0;
+    let mut current_defined_aliases = defined_aliases;
+    loop {
+        let subcommand: &String = &string_args[i..].first()?.to_string();
+        let alias_definition = current_defined_aliases.get(subcommand)?;
+        i += 1;
+        match alias_definition {
+            AliasDefinition::AliasFor(definition) => {
+                let name: Vec<String> = (&string_args[..i]).to_vec();
+                let arguments: Vec<String> = (&string_args[i..]).to_vec();
+                return Some(
+                    AliasMatch {
+                        name: name,
+                        definition: definition,
+                        arguments: arguments,
+                    }
+                );
+            },
+            AliasDefinition::NestedAlias(nested_aliases) => {
+                current_defined_aliases = &nested_aliases;
+            },
+        }
     }
 }
 
@@ -4066,6 +4124,20 @@ mod tests {
         pub bar: Vec<u32>,
         #[arg(long)]
         pub baz: bool,
+    }
+
+    const defined_aliases: HashMap<String, AliasDefinition> = HashMap::from([
+        ("level0", AliasDefinition::AliasFor(Vec::from(["resolved", "level0"]))),
+        ("nested", AliasDefinition::NestedAlias(HashMap::from([
+            ("level1", AliasDefinition::AliasFor(Vec::from(["resolved", "level1"]))),
+            ("deep", AliasDefinition::NestedAlias(HashMap::from([
+                ("level2", AliasDefinition::AliasFor(Vec::from(["resolved", "level2"]))),
+            ]))),
+        ]))),
+    ]);
+
+    #[test]
+    fn test_get_alias_match_simple() {
     }
 
     #[test]
